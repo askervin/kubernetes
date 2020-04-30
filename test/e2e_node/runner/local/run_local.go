@@ -74,7 +74,7 @@ func main() {
 
 func runCommand(name string, args ...string) error {
 	klog.Infof("Running command: %v %v", name, strings.Join(args, " "))
-	cmd := exec.Command("sudo", "sh", "-c", strings.Join(append([]string{name}, args...), " "))
+	cmd := exec.Command("sudo", "-E", "sh", "-c", strings.Join(append([]string{name}, args...), " "))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

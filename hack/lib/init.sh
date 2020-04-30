@@ -40,8 +40,11 @@ KUBE_OUTPUT_BINPATH="${KUBE_OUTPUT}/bin"
 KUBE_RSYNC_COMPRESS="${KUBE_RSYNC_COMPRESS:-0}"
 
 # Set no_proxy for localhost if behind a proxy, otherwise,
-# the connections to localhost in scripts will time out
-export no_proxy=127.0.0.1,localhost
+# the connections to localhost in scripts will time out.
+[[ ",$no_proxy," != *",$(hostname),"* ]] && no_proxy="$(hostname),$no_proxy"
+[[ ",$no_proxy," != *",localhost,"* ]] && no_proxy="localhost,$no_proxy"
+[[ ",$no_proxy," != *",127.0.0.1,"* ]] && no_proxy="127.0.0.1,$no_proxy"
+export no_proxy
 
 # This is a symlink to binaries for "this platform", e.g. build tools.
 export THIS_PLATFORM_BIN="${KUBE_ROOT}/_output/bin"
