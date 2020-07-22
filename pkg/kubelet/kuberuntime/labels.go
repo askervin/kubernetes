@@ -39,6 +39,8 @@ const (
 	containerTerminationMessagePolicyLabel = "io.kubernetes.container.terminationMessagePolicy"
 	containerPreStopHandlerLabel           = "io.kubernetes.container.preStopHandler"
 	containerPortsLabel                    = "io.kubernetes.container.ports"
+	containerResourcesLimitsLabel          = "io.kubernetes.container.resources.limits"
+	containerResourcesRequestsLabel        = "io.kubernetes.container.resources.requests"
 )
 
 type labeledPodSandboxInfo struct {
@@ -141,6 +143,18 @@ func newContainerAnnotations(container *v1.Container, pod *v1.Pod, restartCount 
 			klog.Errorf("Unable to marshal container ports for container %q for pod %q: %v", container.Name, format.Pod(pod), err)
 		} else {
 			annotations[containerPortsLabel] = string(rawContainerPorts)
+		}
+	}
+
+	if container.Resources.Limits != nil {
+		for name, quantity := range container.Resources.Limits {
+			annotations[containerResourcesLimitsLabel+"."+string(name)] = quantity.String()
+		}
+	}
+
+	if container.Resources.Requests != nil {
+		for name, quantity := range container.Resources.Requests {
+			annotations[containerResourcesRequestsLabel+"."+string(name)] = quantity.String()
 		}
 	}
 
