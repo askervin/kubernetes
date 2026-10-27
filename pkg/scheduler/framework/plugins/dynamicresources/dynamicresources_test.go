@@ -5065,6 +5065,186 @@ func testIsSchedulableAfterTargetPodUpdate(tCtx ktesting.TContext) {
 	}
 }
 
+func TestIsSchedulableAfterAssignedPodDelete(t *testing.T) {
+	testIsSchedulableAfterAssignedPodDelete(ktesting.Init(t))
+}
+func testIsSchedulableAfterAssignedPodDelete(tCtx ktesting.TContext) {
+	otherClaimName := otherClaim.Name
+	otherPod := func() *st.PodWrapper {
+		return st.MakePod().Name("other-pod").Namespace(namespace).UID("other-uid")
+	}
+	otherPodWithClaim := otherPod().Node(nodeName).
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &otherClaimName}).
+		Obj()
+	otherPodWithExtendedResource := otherPod().Node(nodeName).
+		Req(map[v1.ResourceName]string{v1.ResourceName(extendedResourceName): "1"}).
+		Obj()
+	otherPodWithoutClaims := otherPod().Node(nodeName).
+		Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+		Obj()
+	nominatedPodWithClaim := otherPod().NominatedNodeName(nodeName).
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &otherClaimName}).
+		Obj()
+
+	testcases := map[string]struct {
+		pod                       *v1.Pod
+		claims                    []*resourceapi.ResourceClaim
+		classes                   []*resourceapi.DeviceClass
+		enableDRAExtendedResource bool
+		oldObj                    interface{}
+		wantHint                  fwk.QueueingHint
+		wantErr                   bool
+	}{
+		"queue-pod-with-claim": {
+			pod:      podWithClaimName,
+			claims:   []*resourceapi.ResourceClaim{pendingClaim},
+			oldObj:   otherPodWithClaim,
+			wantHint: fwk.Queue,
+		},
+		"queue-pod-with-claim-final-state-unknown": {
+			pod:    podWithClaimName,
+			claims: []*resourceapi.ResourceClaim{pendingClaim},
+			oldObj: cache.DeletedFinalStateUnknown{
+				Key: otherPodWithClaim.Namespace + "/" + otherPodWithClaim.Name,
+				Obj: otherPodWithClaim,
+			},
+			wantHint: fwk.Queue,
+		},
+		"queue-pod-with-extended-resource": {
+			pod:                       podWithExtendedResourceName,
+			classes:                   []*resourceapi.DeviceClass{deviceClassWithExtendResourceName},
+			enableDRAExtendedResource: true,
+			oldObj:                    otherPodWithExtendedResource,
+			wantHint:                  fwk.Queue,
+		},
+		"skip-pod-with-extended-resource-disabled": {
+			pod:      podWithClaimName,
+			claims:   []*resourceapi.ResourceClaim{pendingClaim},
+			classes:  []*resourceapi.DeviceClass{deviceClassWithExtendResourceName},
+			oldObj:   otherPodWithExtendedResource,
+			wantHint: fwk.QueueSkip,
+		},
+		"skip-pod-with-extended-resource-without-class": {
+			pod:                       podWithClaimName,
+			claims:                    []*resourceapi.ResourceClaim{pendingClaim},
+			classes:                   []*resourceapi.DeviceClass{deviceClass},
+			enableDRAExtendedResource: true,
+			oldObj:                    otherPodWithExtendedResource,
+			wantHint:                  fwk.QueueSkip,
+		},
+		"skip-pod-without-claims": {
+			pod:      podWithClaimName,
+			claims:   []*resourceapi.ResourceClaim{pendingClaim},
+			oldObj:   otherPodWithoutClaims,
+			wantHint: fwk.QueueSkip,
+		},
+		"skip-nominated-pod": {
+			pod:      podWithClaimName,
+			claims:   []*resourceapi.ResourceClaim{pendingClaim},
+			oldObj:   nominatedPodWithClaim,
+			wantHint: fwk.QueueSkip,
+		},
+		"skip-missing-claim": {
+			pod:      podWithClaimName,
+			oldObj:   otherPodWithClaim,
+			wantHint: fwk.QueueSkip,
+		},
+		"backoff-wrong-old-object": {
+			pod:     podWithClaimName,
+			claims:  []*resourceapi.ResourceClaim{pendingClaim},
+			oldObj:  "not-a-pod",
+			wantErr: true,
+		},
+	}
+
+	for name, tc := range testcases {
+		tCtx.Run(name, func(tCtx ktesting.TContext) {
+			features := feature.Features{
+				EnableDRASchedulerFilterTimeout:    true,
+				EnableDynamicResourceAllocation:    true,
+				EnableDRADeviceBindingConditions:   true,
+				EnableDRAResourceClaimDeviceStatus: true,
+				EnableDRAExtendedResource:          tc.enableDRAExtendedResource,
+			}
+			testCtx := setup(tCtx, nil, nil, tc.claims, tc.classes, nil, nil, features, false, nil)
+			gotHint, err := testCtx.p.isSchedulableAfterAssignedPodDelete(tCtx.Logger(), tc.pod, tc.oldObj, nil)
+			if tc.wantErr {
+				if err == nil {
+					tCtx.Fatal("want an error, got none")
+				}
+				return
+			}
+
+			if err != nil {
+				tCtx.Fatalf("want no error, got: %v", err)
+			}
+			if tc.wantHint != gotHint {
+				tCtx.Fatalf("want %#v, got %#v", tc.wantHint.String(), gotHint.String())
+			}
+		})
+	}
+}
+
+// TestRequeueAfterInFlightAllocationReleased covers a pod which is rejected
+// because the only device is in flight for another pod. The binding cycle of
+// that other pod fails before its claim gets updated, so the release of the
+// device in Unreserve produces no claim event. The AssignedPodDelete event that
+// the scheduler sends for the forgotten pod must requeue the rejected pod.
+func TestRequeueAfterInFlightAllocationReleased(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	features := feature.Features{
+		EnableDRASchedulerFilterTimeout:    true,
+		EnableDynamicResourceAllocation:    true,
+		EnableDRADeviceBindingConditions:   true,
+		EnableDRAResourceClaimDeviceStatus: true,
+	}
+	otherClaimName := otherClaim.Name
+	assumedOtherPod := st.MakePod().Name("other-pod").Namespace(namespace).UID("other-uid").
+		PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &otherClaimName}).
+		Node(nodeName).
+		Obj()
+	testCtx := setup(tCtx, nil, []*v1.Node{workerNode}, []*resourceapi.ResourceClaim{pendingClaim, otherClaim}, []*resourceapi.DeviceClass{deviceClass}, nil, []apiruntime.Object{workerNodeSlice}, features, false, nil)
+
+	otherState := framework.NewCycleState()
+	_, status := testCtx.p.PreFilter(tCtx, otherState, assumedOtherPod, testCtx.nodeInfos)
+	require.True(tCtx, status.IsSuccess(), "PreFilter of the other pod: %v", status)
+	status = testCtx.p.Filter(tCtx, otherState, assumedOtherPod, testCtx.nodeInfos[0])
+	require.True(tCtx, status.IsSuccess(), "Filter of the other pod: %v", status)
+	status = testCtx.p.Reserve(tCtx, otherState, assumedOtherPod, nodeName)
+	require.True(tCtx, status.IsSuccess(), "Reserve of the other pod: %v", status)
+	require.Len(tCtx, testCtx.listInFlightClaims(), 1, "in-flight claims after Reserve")
+
+	state := framework.NewCycleState()
+	_, status = testCtx.p.PreFilter(tCtx, state, podWithClaimName, testCtx.nodeInfos)
+	require.True(tCtx, status.IsSuccess(), "PreFilter: %v", status)
+	status = testCtx.p.Filter(tCtx, state, podWithClaimName, testCtx.nodeInfos[0])
+	require.Equal(tCtx, fwk.UnschedulableAndUnresolvable, status.Code(), "Filter while the device is in flight: %v", status)
+
+	testCtx.p.Unreserve(tCtx, otherState, assumedOtherPod, nodeName)
+	require.Empty(tCtx, testCtx.listInFlightClaims(), "in-flight claims after Unreserve")
+
+	// This is what handleBindingCycleError sends after Unreserve.
+	event := framework.EventAssignedPodDelete
+	events, err := testCtx.p.EventsToRegister(tCtx)
+	require.NoError(tCtx, err)
+	var hintFn fwk.QueueingHintFn
+	for _, registered := range events {
+		if framework.MatchClusterEvents(registered.Event, event) {
+			hintFn = registered.QueueingHintFn
+		}
+	}
+	require.NotNil(tCtx, hintFn, "no queueing hint registered for %s", event.Label())
+	hint, err := hintFn(tCtx.Logger(), podWithClaimName, assumedOtherPod, nil)
+	require.NoError(tCtx, err)
+	require.Equal(tCtx, fwk.Queue, hint)
+
+	state = framework.NewCycleState()
+	_, status = testCtx.p.PreFilter(tCtx, state, podWithClaimName, testCtx.nodeInfos)
+	require.True(tCtx, status.IsSuccess(), "PreFilter after Unreserve: %v", status)
+	status = testCtx.p.Filter(tCtx, state, podWithClaimName, testCtx.nodeInfos[0])
+	require.True(tCtx, status.IsSuccess(), "Filter after Unreserve: %v", status)
+}
+
 // mockDeviceClassResolver is a simple mock implementation of fwk.DeviceClassResolver for testing
 type mockDeviceClassResolver struct {
 	mapping map[v1.ResourceName]*resourceapi.DeviceClass

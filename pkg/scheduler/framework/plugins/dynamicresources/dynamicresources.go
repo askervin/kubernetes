@@ -286,6 +286,18 @@ func (pl *DynamicResources) EventsToRegister(_ context.Context) ([]fwk.ClusterEv
 		{Event: fwk.ClusterEvent{Resource: fwk.Node, ActionType: fwk.Add | fwk.UpdateNodeLabel | fwk.UpdateNodeAllocatable}},
 		// Allocation is tracked in ResourceClaims, so any changes may make the pods schedulable.
 		{Event: fwk.ClusterEvent{Resource: fwk.ResourceClaim, ActionType: fwk.Add | fwk.Update | fwk.Delete}, QueueingHintFn: pl.isSchedulableAfterClaimChange, PreQueueingHintFn: pl.preQueueingHint},
+		// Allocations made in Reserve stay in flight until PreBind has stored them in
+		// the claims. If the binding cycle fails, Unreserve releases them and the
+		// scheduler reports the forgotten assumed pod as AssignedPodDelete. No
+		// ResourceClaim event reports that release when the allocation never reached
+		// the claim (the pod was rejected in Permit, PreBind failed before updating
+		// the claim) or when the claim got deleted while PreBind waited for binding
+		// conditions: its deallocation requeued pods while the devices were still
+		// in flight.
+		//
+		// No PreQueueingHintFn: its narrowing applies to all plugins registered for
+		// this event.
+		{Event: fwk.ClusterEvent{Resource: fwk.AssignedPod, ActionType: fwk.Delete}, QueueingHintFn: pl.isSchedulableAfterAssignedPodDelete},
 		// Adding the ResourceClaim name to the pod status makes pods waiting for their ResourceClaim schedulable.
 		{Event: fwk.ClusterEvent{Resource: fwk.TargetPod, ActionType: fwk.UpdatePodGeneratedResourceClaim}, QueueingHintFn: pl.isSchedulableAfterTargetPodUpdate},
 		// A pod might be waiting for a class to get created or modified.
@@ -493,6 +505,45 @@ func (pl *DynamicResources) isSchedulableAfterTargetPodUpdate(logger klog.Logger
 	}
 
 	logger.V(5).Info("pod got updated and is schedulable", "pod", klog.KObj(pod))
+	return fwk.Queue, nil
+}
+
+// isSchedulableAfterAssignedPodDelete is invoked when an assigned pod gets deleted
+// and when the scheduler forgets an assumed pod after a failed binding cycle. In the
+// latter case Unreserve has released the in-flight allocations of the pod's claims,
+// which may be the devices that a previously unschedulable pod was waiting for.
+func (pl *DynamicResources) isSchedulableAfterAssignedPodDelete(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	deletedPod, _, err := schedutil.As[*v1.Pod](oldObj, newObj)
+	if err != nil {
+		// Shouldn't happen.
+		return fwk.Queue, fmt.Errorf("unexpected object in isSchedulableAfterAssignedPodDelete: %w", err)
+	}
+
+	// Allocations are only in flight for assumed pods, which have a node name.
+	// Nominated pods hold nothing in this plugin.
+	if deletedPod.Spec.NodeName == "" {
+		logger.V(6).Info("deleted pod was not assigned to a node", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+		return fwk.QueueSkip, nil
+	}
+
+	// Only pods with claims or, as checked by preFilterExtendedResources, with
+	// extended resources backed by DRA can have had allocations.
+	if len(deletedPod.Spec.ResourceClaims) == 0 &&
+		(!pl.fts.EnableDRAExtendedResource ||
+			!hasDeviceClassMappedExtendedResource(resource.PodRequests(deletedPod, resource.PodResourcesOptions{}), pl.draManager.DeviceClassResolver())) {
+		logger.V(6).Info("deleted pod had no claims", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+		return fwk.QueueSkip, nil
+	}
+
+	if err := pl.foreachPodResourceClaim(pod, nil); err != nil {
+		// This is not an unexpected error: we know that
+		// foreachPodResourceClaim only returns errors for "not
+		// schedulable".
+		logger.V(6).Info("pod is not schedulable after assigned pod deletion", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod), "reason", err.Error())
+		return fwk.QueueSkip, nil
+	}
+
+	logger.V(5).Info("pod with claims got deleted or forgotten, devices may have become available", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
 	return fwk.Queue, nil
 }
 
