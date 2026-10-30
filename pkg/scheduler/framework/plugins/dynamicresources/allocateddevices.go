@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
@@ -101,6 +102,8 @@ type allocatedDevices struct {
 	shareIDs                  sets.Set[structured.SharedDeviceID]
 	capacities                structured.ConsumedCapacityCollection
 	enabledConsumableCapacity bool
+	// claims are the UIDs of the claims whose devices are included above.
+	claims sets.Set[types.UID]
 }
 
 func newAllocatedDevices(logger klog.Logger) *allocatedDevices {
@@ -110,6 +113,7 @@ func newAllocatedDevices(logger klog.Logger) *allocatedDevices {
 		shareIDs:                  sets.New[structured.SharedDeviceID](),
 		capacities:                structured.NewConsumedCapacityCollection(),
 		enabledConsumableCapacity: utilfeature.DefaultFeatureGate.Enabled(features.DRAConsumableCapacity),
+		claims:                    sets.New[types.UID](),
 	}
 }
 
@@ -139,6 +143,16 @@ func (a *allocatedDevices) Revision() int64 {
 	defer a.mutex.RUnlock()
 
 	return a.revision
+}
+
+// HasClaim reports whether the devices of the claim with the given UID
+// are included in the results of Get, GetSharedDeviceIDs and Capacities.
+// Like those, the answer is valid for the current revision.
+func (a *allocatedDevices) HasClaim(claimUID types.UID) bool {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+
+	return a.claims.Has(claimUID)
 }
 
 func (a *allocatedDevices) handlers() cache.ResourceEventHandler {
@@ -228,6 +242,7 @@ func (a *allocatedDevices) addDevices(claim *resourceapi.ResourceClaim) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	a.revision++
+	a.claims.Insert(claim.UID)
 	for _, deviceID := range deviceIDs {
 		a.ids.Insert(deviceID)
 	}
@@ -275,6 +290,7 @@ func (a *allocatedDevices) removeDevices(claim *resourceapi.ResourceClaim) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	a.revision++
+	a.claims.Delete(claim.UID)
 	for _, deviceID := range deviceIDs {
 		a.ids.Delete(deviceID)
 	}

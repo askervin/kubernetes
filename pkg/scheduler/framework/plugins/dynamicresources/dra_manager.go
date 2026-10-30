@@ -400,8 +400,16 @@ func (c *claimTracker) GatherAllocatedState() (s *structured.AllocatedState, err
 		aggregatedCapacity = make(schedulerapi.ConsumedCapacityCollection)
 	}
 
-	// Whatever is in flight also has to be checked.
-	for _, inFlight := range c.allInFlightAllocationsRLocked() {
+	// Whatever is in flight also has to be checked, unless the claim
+	// is already allocated in the assume cache and therefore included
+	// above. That is the case while PreBind waits for binding
+	// conditions: the allocation has been stored, but it stays in flight
+	// until PreBind succeeds. Adding it again would count the consumed
+	// capacity of its shared devices twice.
+	for claimUID, inFlight := range c.allInFlightAllocationsRLocked() {
+		if c.allocatedDevices.HasClaim(claimUID) {
+			continue
+		}
 		claim := inFlight.claim
 		foreachAllocatedDevice(claim,
 			func(deviceID structured.DeviceID) { // dedicatedDeviceCallback

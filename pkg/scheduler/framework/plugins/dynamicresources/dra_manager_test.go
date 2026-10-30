@@ -22,8 +22,13 @@ import (
 
 	"github.com/onsi/gomega"
 	resourceapi "k8s.io/api/resource/v1"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/dynamic-resource-allocation/structured/schedulerapi"
+	"k8s.io/kubernetes/pkg/features"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
 	"k8s.io/kubernetes/test/utils/ktesting"
@@ -263,4 +268,74 @@ func testMaybeRemoveClaimPendingAllocation(tCtx ktesting.TContext) {
 			tCtx.Expect(c.inFlightAllocations).To(gomega.Equal(test.expectedInFlightAllocations))
 		})
 	}
+}
+
+// TestGatherAllocatedStateWhileWaitingForBindingConditions follows a claim
+// with consumable capacity through the claim tracker the way Reserve,
+// PreBind (bindClaim) and the claim informer update it. While PreBind waits
+// for binding conditions, the allocation is both stored in the assume cache
+// and in flight. The capacity which it consumes must be counted once,
+// otherwise the device looks fuller than it is and other claims which
+// would fit are rejected until PreBind is done.
+func TestGatherAllocatedStateWhileWaitingForBindingConditions(t *testing.T) {
+	testGatherAllocatedStateWhileWaitingForBindingConditions(ktesting.Init(t))
+}
+func testGatherAllocatedStateWhileWaitingForBindingConditions(tCtx ktesting.TContext) {
+	featuregatetesting.SetFeatureGateDuringTest(tCtx, utilfeature.DefaultFeatureGate, features.DRAConsumableCapacity, true)
+
+	informer := &testInformer{}
+	c := &claimTracker{
+		cache:               assumecache.NewAssumeCache(tCtx.Logger(), informer, "ResourceClaim", "", nil),
+		inFlightAllocations: make(map[types.UID]inFlightAllocation),
+		allocatedDevices:    newAllocatedDevices(tCtx.Logger()),
+		logger:              tCtx.Logger(),
+	}
+	c.cache.AddEventHandler(c.allocatedDevices.handlers())
+
+	pending := st.FromResourceClaim(pendingClaim).UID(string(claimUID)).Obj()
+	pending.ResourceVersion = "1"
+	// What Reserve signals as pending allocation: the claim with the
+	// allocation, not stored yet.
+	reserved := st.FromResourceClaim(pending).Allocation(allocationResultWithConsumedCapacity).Obj()
+	// What bindClaim gets back from the apiserver and assumes.
+	allocated := reserved.DeepCopy()
+	allocated.ResourceVersion = "2"
+	deallocated := pending.DeepCopy()
+	deallocated.ResourceVersion = "3"
+
+	deviceID := schedulerapi.MakeDeviceID(driver, nodeName, sharedDeviceName)
+	expectConsumed := func(phase string, expected *apiresource.Quantity) {
+		tCtx.Helper()
+		state, err := c.GatherAllocatedState()
+		tCtx.ExpectNoError(err, phase)
+		capacity, found := state.AggregatedCapacity[deviceID]
+		if expected == nil {
+			tCtx.Expect(found).To(gomega.BeFalseBecause("%s: no capacity of %s should be consumed, got %v", phase, deviceID, capacity))
+			return
+		}
+		tCtx.Expect(found).To(gomega.BeTrueBecause("%s: capacity of %s should be consumed", phase, deviceID))
+		tCtx.Expect(capacity[capacityName]).ToNot(gomega.BeNil(), phase)
+		tCtx.Expect(capacity[capacityName].Cmp(*expected)).To(gomega.Equal(0), "%s: consumed %s: got %s, want %s", phase, capacityName, capacity[capacityName], expected)
+	}
+	one := apiresource.MustParse("1")
+
+	informer.add(pending)
+	expectConsumed("pending", nil)
+
+	// Reserve.
+	tCtx.ExpectNoError(c.SignalClaimPendingAllocation(claimUID, reserved))
+	expectConsumed("in flight", &one)
+
+	// bindClaim stored the allocation, PreBind waits for binding conditions.
+	tCtx.ExpectNoError(c.AssumeClaimAfterAPICall(allocated))
+	expectConsumed("in flight and allocated", &one)
+	informer.add(allocated)
+	expectConsumed("in flight and allocated, informer caught up", &one)
+
+	// PreBind succeeded.
+	tCtx.Expect(c.MaybeRemoveClaimPendingAllocation(claimUID, true)).To(gomega.BeTrueBecause("the in-flight allocation should get removed"))
+	expectConsumed("allocated", &one)
+
+	informer.add(deallocated)
+	expectConsumed("deallocated", nil)
 }
